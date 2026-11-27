@@ -19,6 +19,10 @@
   button.rec.on { background: #c1121f; animation: blink 1s infinite; }
   @keyframes blink { 50% { opacity: .6; } }
   button:disabled { opacity: .4; cursor: default; }
+  .share { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 8px; }
+  .importLbl { font-size: 16px; padding: 8px 14px; border-radius: 10px; border: 1px solid #e3d3b0; background: #fffaf0; cursor: pointer; }
+  #exportBtn { background: #8ac926; border-color: #8ac926; color: #10220a; font-weight: 700; }
+  .tip { color: #6b5a3a; font-size: 14px; flex-basis: 100%; }
   #status { position: sticky; top: 0; background: #fff7e6; padding: 8px 0; color: #8a6d3b; min-height: 1.4em; }
 </style>
 </head>
@@ -28,6 +32,11 @@
   <h1>🎙 อัดเสียงของคุณเอง</h1>
   <p class="lead">กด <b>● อัด</b> แล้วพูดประโยคนั้น กดอีกครั้งเพื่อหยุด (หยุดเองใน 4 วินาที) · กด ▶ เพื่อฟัง<br>
     เสียงเก็บไว้ในเบราว์เซอร์เครื่องนี้เท่านั้น ไม่ได้ส่งไปไหน · อัดไม่ครบก็ได้ ข้อที่ไม่ได้อัดเกมจะเงียบไว้</p>
+  <div class="share">
+    <button id="exportBtn">📦 ส่งออกชุดเสียง</button>
+    <label class="importLbl">📥 นำเข้าชุดเสียง<input id="importFile" type="file" accept=".json,application/json" hidden></label>
+    <span class="tip">อัดให้คนอื่น? อัดเสร็จกด <b>ส่งออก</b> แล้วส่งไฟล์ให้เจ้าของเกม · เจ้าของเกมกด <b>นำเข้า</b> แล้วเลือกไฟล์นั้น</span>
+  </div>
   <div id="status"></div>
   <div id="list"></div>
 </main>
@@ -112,9 +121,43 @@ $('list').addEventListener('click', async e => {
   else if (btn.classList.contains('del')) { await delClip(id); have.delete(id); render(); }
 });
 
+// ---- voice pack: one JSON file so someone else's recordings can be sent and imported ----
+const KNOWN = new Set(GROUPS.flatMap(([, items]) => items.map(([id]) => id)));
+const MAX_CLIP_B64 = 2_000_000;                      // ~1.5 MB per clip is far more than 4 s needs
+const toB64 = blob => new Promise((res, rej) => {
+  const r = new FileReader(); r.onload = () => res(String(r.result).split(',')[1]); r.onerror = () => rej(r.error); r.readAsDataURL(blob);
+});
+async function exportPack() {
+  const ids = await allIds();
+  if (!ids.length) { status('ยังไม่มีเสียงให้ส่งออก — อัดก่อนนะ'); return; }
+  const clips = [];
+  for (const id of ids) { const c = await getClip(id); clips.push({ id, type: c.blob.type || 'audio/webm', data: await toB64(c.blob) }); }
+  const d = new Date(), stamp = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`;
+  const blob = new Blob([JSON.stringify({ app: 'hand-play-voice', v: 1, clips })], { type: 'application/json' });
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `hand-play-voice-${stamp}.json`; a.click();
+  status(`ส่งออก ${clips.length} ประโยคแล้ว — ส่งไฟล์ ${a.download} ให้เจ้าของเกมได้เลย`);
+}
+async function importPack(file) {
+  let pack;
+  try { pack = JSON.parse(await file.text()); } catch { status('ไฟล์นี้อ่านไม่ได้ — ต้องเป็นไฟล์ที่ได้จากปุ่มส่งออก'); return; }
+  if (pack?.app !== 'hand-play-voice' || !Array.isArray(pack.clips)) { status('ไม่ใช่ไฟล์ชุดเสียงของ Hand Play'); return; }
+  let n = 0;
+  for (const c of pack.clips) {
+    // only the phrases this game knows, only audio, and a sane size
+    if (!KNOWN.has(c?.id) || typeof c.data !== 'string' || c.data.length > MAX_CLIP_B64 || !/^audio\//.test(c.type || '')) continue;
+    try {
+      const bytes = Uint8Array.from(atob(c.data), ch => ch.charCodeAt(0));
+      await putClip(c.id, new Blob([bytes], { type: c.type })); have.add(c.id); n++;
+    } catch {}
+  }
+  render(); status(`นำเข้า ${n} ประโยคแล้ว 🎉 กลับไปเล่นเกมนับนิ้วได้เลย`);
+}
+$('exportBtn').onclick = () => exportPack().catch(e => status('ส่งออกไม่สำเร็จ: ' + e.message));
+$('importFile').onchange = e => { const f = e.target.files[0]; if (f) importPack(f); e.target.value = ''; };
+
 have = new Set(await allIds().catch(() => []));
 render();
-window.__voice = { putClip, allIds, delClip };   // test hook
+window.__voice = { putClip, allIds, delClip, exportPack, importPack };   // test hooks
 </script>
 </body>
 </html>

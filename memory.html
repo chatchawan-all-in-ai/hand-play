@@ -172,6 +172,13 @@ function draw(t) {
 
 // ---- camera + loop ------------------------------------------------------------------------
 let tracker = null, lastVT = -1, smooth = null, lostAt = 0;
+// Reach: the pointer moves 1.35× further than the hand from the middle, so edge cards are
+// reachable with the hand comfortably inside the camera picture (same as car.html).
+const REACH = 1.35;
+function reach(p) {
+  const x = W / 2 + (p.x - W / 2) * REACH, y = H * 0.5 + (p.y - H * 0.5) * REACH;
+  return { x: Math.min(Math.max(x, 0), W), y: Math.min(Math.max(y, 0), H) };
+}
 async function start(level) {
   for (const b of ['easyBtn', 'midBtn', 'hardBtn']) $(b).disabled = true;
   try {
@@ -199,7 +206,7 @@ function loop(t) {
     lastVT = video.currentTime;
     const L = tracker.detectForVideo(video, t).landmarks?.[0];
     if (L) {
-      const p = toScreen(L[8]); lostAt = 0;
+      const p = reach(toScreen(L[8])); lostAt = 0;
       smooth = smooth ? { x: smooth.x + (p.x - smooth.x) * 0.5, y: smooth.y + (p.y - smooth.y) * 0.5 } : p;
     } else if (!lostAt) lostAt = t;
     if (lostAt && t - lostAt > 250) smooth = null;                  // keep the pointer through a brief dropout
@@ -211,7 +218,7 @@ addEventListener('resize', resize); resize();
 $('easyBtn').onclick = () => start('easy');
 $('midBtn').onclick = () => start('mid');
 $('hardBtn').onclick = () => start('hard');
-window.__mem = { game, step, startGame, draw, layout, size: () => [W, H] };   // test hooks
+window.__mem = { game, step, startGame, draw, layout, reach, size: () => [W, H] };   // test hooks
 </script>
 </body>
 </html>

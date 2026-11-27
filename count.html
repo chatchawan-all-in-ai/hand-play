@@ -169,6 +169,24 @@ const pick = a => a[Math.floor(Math.random() * a.length)];
 
 // ---- recorded voice (voice.html) — used instead of the synthetic voice once any clip exists ----
 const clips = {};                       // id -> object URL
+const VOICE_IDS = new Set(['ask_1', 'ask_2', 'cheer_1', 'cheer_2', 'cheer_3', 'help_1', 'help_2', 'finish',
+  ...Array.from({ length: 10 }, (_, i) => `num_${i + 1}`)]);
+// if voice.html was linked to a server (Google Apps Script), fetch the newest recordings first
+async function pullFromServer(db) {
+  let c; try { c = JSON.parse(localStorage.getItem('hand-play-voice-server')); } catch {}
+  if (!c?.s || !c?.k) return;
+  try {
+    const ctrl = new AbortController(); setTimeout(() => ctrl.abort(), 8000);
+    const j = await (await fetch(`${c.s}?k=${encodeURIComponent(c.k)}`, { signal: ctrl.signal })).json();
+    if (!j.ok || !Array.isArray(j.clips)) return;
+    const store = db.transaction('clips', 'readwrite').objectStore('clips');
+    for (const x of j.clips) {
+      if (!VOICE_IDS.has(x.id) || !/^audio\//.test(x.type || '') || typeof x.data !== 'string' || x.data.length > 2_000_000) continue;
+      store.put({ id: x.id, blob: new Blob([Uint8Array.from(atob(x.data), ch => ch.charCodeAt(0))], { type: x.type }) });
+    }
+    await new Promise(res => { store.transaction.oncomplete = res; store.transaction.onerror = res; });
+  } catch {}                            // offline or server down: just use what this browser has
+}
 async function loadClips() {
   try {
     const db = await new Promise((res, rej) => {
@@ -176,6 +194,7 @@ async function loadClips() {
       r.onupgradeneeded = () => r.result.createObjectStore('clips', { keyPath: 'id' });
       r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
     });
+    await pullFromServer(db);
     const all = await new Promise((res, rej) => {
       const q = db.transaction('clips').objectStore('clips').getAll();
       q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error);

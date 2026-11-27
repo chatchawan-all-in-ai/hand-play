@@ -23,6 +23,13 @@
   .importLbl { font-size: 16px; padding: 8px 14px; border-radius: 10px; border: 1px solid #e3d3b0; background: #fffaf0; cursor: pointer; }
   #exportBtn { background: #8ac926; border-color: #8ac926; color: #10220a; font-weight: 700; }
   .tip { color: #6b5a3a; font-size: 14px; flex-basis: 100%; }
+  .cloud { padding: 10px 14px; border-radius: 12px; margin-bottom: 10px; background: #e8f6ff; color: #0b4f71; }
+  .cloud.off { background: #f3ead8; color: #6b5a3a; }
+  details { margin-bottom: 12px; }
+  summary { cursor: pointer; color: #8a6d3b; }
+  details input { display: block; width: 100%; box-sizing: border-box; font-size: 15px; padding: 8px 10px; margin: 6px 0; border: 1px solid #e3d3b0; border-radius: 8px; }
+  #pullBtn { background: #4cc9f0; border-color: #4cc9f0; color: #062431; font-weight: 700; }
+  .cl { width: 1.4em; text-align: center; }
   #status { position: sticky; top: 0; background: #fff7e6; padding: 8px 0; color: #8a6d3b; min-height: 1.4em; }
 </style>
 </head>
@@ -32,7 +39,20 @@
   <h1>🎙 อัดเสียงของคุณเอง</h1>
   <p class="lead">กด <b>● อัด</b> แล้วพูดประโยคนั้น กดอีกครั้งเพื่อหยุด (หยุดเองใน 4 วินาที) · กด ▶ เพื่อฟัง<br>
     เสียงเก็บไว้ในเบราว์เซอร์เครื่องนี้เท่านั้น ไม่ได้ส่งไปไหน · อัดไม่ครบก็ได้ ข้อที่ไม่ได้อัดเกมจะเงียบไว้</p>
+  <div id="cloud" class="cloud"></div>
+  <details id="setup">
+    <summary>⚙️ ตั้งค่า server (สำหรับเจ้าของเกม)</summary>
+    <p class="tip">วาง Web app URL จาก Google Apps Script และรหัส (KEY) ที่ตั้งไว้ในสคริปต์</p>
+    <input id="srvUrl" placeholder="https://script.google.com/macros/s/…/exec">
+    <input id="srvKey" placeholder="รหัส (KEY)">
+    <div class="share">
+      <button id="saveSrv">บันทึก</button>
+      <button id="copyLink">🔗 คัดลอกลิงก์ให้คนอัด</button>
+      <button id="clearSrv">ล้างการตั้งค่า</button>
+    </div>
+  </details>
   <div class="share">
+    <button id="pullBtn">☁️ ดึงเสียงจาก server</button>
     <button id="exportBtn">📦 ส่งออกชุดเสียง</button>
     <label class="importLbl">📥 นำเข้าชุดเสียง<input id="importFile" type="file" accept=".json,application/json" hidden></label>
     <span class="tip">อัดให้คนอื่น? อัดเสร็จกด <b>ส่งออก</b> แล้วส่งไฟล์ให้เจ้าของเกม · เจ้าของเกมกด <b>นำเข้า</b> แล้วเลือกไฟล์นั้น</span>
@@ -78,6 +98,7 @@ function render() {
   $('list').innerHTML = GROUPS.map(([title, items]) => `<h2>${title}</h2>` + items.map(([id, text]) => `
     <div class="row" data-id="${id}">
       <span class="ok">${have.has(id) ? '✓' : ''}</span>
+      <span class="cl" title="ขึ้น server แล้ว">${sent.has(id) ? '☁️' : ''}</span>
       <span class="say">${text}</span>
       <button class="rec">● อัด</button>
       <button class="play" ${have.has(id) ? '' : 'disabled'}>▶ ฟัง</button>
@@ -100,6 +121,7 @@ async function startRec(id, btn) {
     rec = null; recId = null; clearTimeout(stopTimer);
     if (blob.size < 1500) { status('สั้นเกินไป ลองอัดใหม่'); return; }
     await putClip(id, blob); have.add(id); render(); play(id);
+    if (cfg()) upload(id, blob);           // send it to the owner's server right away
   };
   rec.start(); btn.classList.add('on'); btn.textContent = '■ หยุด';
   status('กำลังอัด… พูดได้เลย');
@@ -140,6 +162,9 @@ async function exportPack() {
 async function importPack(file) {
   let pack;
   try { pack = JSON.parse(await file.text()); } catch { status('ไฟล์นี้อ่านไม่ได้ — ต้องเป็นไฟล์ที่ได้จากปุ่มส่งออก'); return; }
+  return importPackObj(pack);
+}
+async function importPackObj(pack) {
   if (pack?.app !== 'hand-play-voice' || !Array.isArray(pack.clips)) { status('ไม่ใช่ไฟล์ชุดเสียงของ Hand Play'); return; }
   let n = 0;
   for (const c of pack.clips) {
@@ -152,12 +177,71 @@ async function importPack(file) {
   }
   render(); status(`นำเข้า ${n} ประโยคแล้ว 🎉 กลับไปเล่นเกมนับนิ้วได้เลย`);
 }
+// ---- server (Google Apps Script web app, see apps-script/Code.gs) --------------------------
+// Owner saves URL + key once; "copy link" makes a voice.html link that carries them, so a
+// helper who opens it records straight to the owner's Drive. Stored in this browser only.
+const CFG = 'hand-play-voice-server';
+const sent = new Set();
+function cfg() { try { const c = JSON.parse(localStorage.getItem(CFG)); return c?.s && c?.k ? c : null; } catch { return null; } }
+function setCfg(c) { try { c ? localStorage.setItem(CFG, JSON.stringify(c)) : localStorage.removeItem(CFG); } catch {} showCloud(); }
+function showCloud() {
+  const c = cfg(), box = $('cloud');
+  box.className = 'cloud' + (c ? '' : ' off');
+  box.textContent = c ? '☁️ เชื่อม server แล้ว — อัดเสร็จแต่ละประโยค เสียงจะส่งไปให้เจ้าของเกมทันที'
+                      : 'ยังไม่ได้เชื่อม server — เสียงจะเก็บไว้ในเครื่องนี้เท่านั้น (ใช้ปุ่มส่งออกเพื่อส่งไฟล์แทนได้)';
+  $('srvUrl').value = c?.s || ''; $('srvKey').value = c?.k || '';
+}
+const validUrl = s => /^https:\/\/script\.google(usercontent)?\.com\/.+/.test(s);
+async function upload(id, blob) {
+  const c = cfg(); if (!c) return;
+  try {
+    const body = JSON.stringify({ k: c.k, id, type: blob.type || 'audio/webm', data: await toB64(blob) });
+    const r = await fetch(c.s, { method: 'POST', body });          // text/plain: no CORS preflight
+    const j = await r.json();
+    if (!j.ok) throw new Error(j.error || 'server error');
+    sent.add(id); render(); status(`☁️ ส่ง "${id}" ขึ้น server แล้ว`);
+  } catch (e) { status('ส่งขึ้น server ไม่สำเร็จ: ' + (e.message || e) + ' — ลองอัดใหม่อีกครั้ง'); }
+}
+async function pull() {
+  const c = cfg(); if (!c) { status('ยังไม่ได้ตั้งค่า server — เปิด ⚙️ ตั้งค่า server ก่อน'); $('setup').open = true; return; }
+  status('กำลังดึงเสียงจาก server…');
+  try {
+    const j = await (await fetch(`${c.s}?k=${encodeURIComponent(c.k)}`)).json();
+    if (!j.ok) throw new Error(j.error || 'server error');
+    await importPackObj(j);
+    j.clips.forEach(x => sent.add(x.id)); render();
+    status(`ดึงเสียงจาก server ได้ ${j.clips.length} ประโยค 🎉`);
+  } catch (e) { status('ดึงเสียงไม่สำเร็จ: ' + (e.message || e)); }
+}
+// a link like voice.html?s=<url>&k=<key> configures this browser, then hides the params
+{
+  const p = new URLSearchParams(location.search);
+  if (p.get('s') && p.get('k') && validUrl(p.get('s'))) {
+    setCfg({ s: p.get('s'), k: p.get('k') });
+    history.replaceState(null, '', location.pathname);
+  }
+}
+$('saveSrv').onclick = () => {
+  const s = $('srvUrl').value.trim(), k = $('srvKey').value.trim();
+  if (!validUrl(s) || !k) { status('URL ต้องขึ้นต้นด้วย https://script.google.com/ และต้องใส่รหัส'); return; }
+  setCfg({ s, k }); status('บันทึกการตั้งค่า server แล้ว');
+};
+$('clearSrv').onclick = () => { setCfg(null); status('ล้างการตั้งค่า server แล้ว'); };
+$('copyLink').onclick = async () => {
+  const c = cfg(); if (!c) { status('บันทึกการตั้งค่าก่อน แล้วค่อยคัดลอกลิงก์'); return; }
+  const link = `${location.origin}${location.pathname}?s=${encodeURIComponent(c.s)}&k=${encodeURIComponent(c.k)}`;
+  try { await navigator.clipboard.writeText(link); status('คัดลอกลิงก์แล้ว — ส่งให้คนอัดได้เลย'); }
+  catch { prompt('คัดลอกลิงก์นี้ส่งให้คนอัด', link); }
+};
+$('pullBtn').onclick = pull;
+showCloud();
+
 $('exportBtn').onclick = () => exportPack().catch(e => status('ส่งออกไม่สำเร็จ: ' + e.message));
 $('importFile').onchange = e => { const f = e.target.files[0]; if (f) importPack(f); e.target.value = ''; };
 
 have = new Set(await allIds().catch(() => []));
 render();
-window.__voice = { putClip, allIds, delClip, exportPack, importPack };   // test hooks
+window.__voice = { putClip, allIds, delClip, exportPack, importPack, upload, pull, setCfg, cfg };   // test hooks
 </script>
 </body>
 </html>

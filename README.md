@@ -32,6 +32,27 @@ bridge/.venv/bin/python bridge/server.py          # --dry-run prints instead of 
 - Modes: **เมาส์ตรงนิ้ว** (absolute — press Calibrate once) or **trackpad** (relative).
 - Keep the page visible; browsers pause camera work in hidden windows.
 
+## Recorded voice (`voice.html` + `count.html`)
+
+The counting game speaks with clips a family member records on `voice.html`.
+Clips live in the browser (IndexedDB). To let someone else record from their own
+phone, either send a voice-pack file (📦 export / 📥 import) or use the optional
+Google Apps Script inbox below.
+
+### Optional: voice inbox on Google Drive
+
+1. Open https://script.google.com → **New project**, paste `apps-script/Code.gs`.
+2. Change `KEY` to your own secret word, then **Deploy → New deployment → Web app**,
+   *Execute as: Me*, *Who has access: Anyone* → **Deploy** → authorize.
+3. Copy the **Web app URL**. On `voice.html` open **⚙️ ตั้งค่า server**, paste the URL
+   and the key, **บันทึก**, then **🔗 คัดลอกลิงก์ให้คนอัด** and send that link.
+4. Every clip the helper records is saved to the Drive folder `hand-play-voice`.
+   `count.html` pulls the newest set each time it opens; ☁️ on `voice.html` pulls on demand.
+
+Anyone holding the link can upload, so share it only with people you trust.
+The server accepts only the 18 phrase ids, audio types and a size limit, and the
+newest recording of a phrase replaces the old one.
+
 ## Notes
 
 - Hand tracking model and WASM load from the MediaPipe CDN on first use.

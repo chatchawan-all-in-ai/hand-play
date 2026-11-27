@@ -1,0 +1,424 @@
+<!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hand Side</title>
+<style>
+  body { margin: 0; background: #111; color: #eee; font: 16px/1.4 system-ui, -apple-system, sans-serif; text-align: center; }
+  button { margin: 14px; padding: 8px 18px; font-size: 16px; border-radius: 8px; border: 1px solid #555; background: #2a2a2a; color: #eee; cursor: pointer; }
+  #stage { width: 100%; max-width: 720px; margin: 0 auto; aspect-ratio: 4 / 3; background: #000; }
+  canvas { width: 100%; height: 100%; display: block; }
+  video { display: none; }
+  #readout { font-size: 40px; font-weight: 700; min-height: 1.6em; margin: 10px; }
+  #status { color: #888; font-size: 14px; }
+  .pill { padding: 3px 10px; border-radius: 999px; background: #222; color: #888; font-size: 14px; }
+  .pill.on { background: #3ddc84; color: #000; }
+  .pill.bad { background: #ff6b6b; color: #000; }
+</style>
+</head>
+<body>
+<button id="startBtn">เปิดกล้อง</button>
+<div id="status">ยังไม่ได้เปิดกล้อง</div>
+<div id="ctlbar" style="margin:8px;display:flex;gap:10px;justify-content:center;align-items:center;flex-wrap:wrap">
+  <span id="wsState" class="pill">bridge: ยังไม่เชื่อม</span>
+  <button id="ctlBtn" style="margin:0">เปิดควบคุมเมาส์ (Space)</button>
+  <label style="color:#aaa">โหมด <select id="mode"><option value="abs">เมาส์ตรงนิ้ว</option><option value="rel">trackpad</option></select></label>
+  <button id="calibBtn" style="margin:0">Calibrate</button>
+  <label id="speedBox" style="color:#aaa;display:none">ความเร็ว <input id="speed" type="range" min="0.3" max="3" step="0.1" value="1"> <span id="speedVal">1.0</span></label>
+  <span id="moving" style="color:#ffd166;min-width:9em"></span>
+</div>
+<div id="readout">—</div>
+<div id="detail" style="color:#ccc;min-height:1.4em;margin-bottom:4px"></div>
+<div id="debug" style="color:#888;font:12px ui-monospace,monospace;min-height:1.4em;margin-bottom:8px"></div>
+<div id="stage"><video id="video" playsinline muted></video><canvas id="canvas" width="640" height="480"></canvas></div>
+
+<script type="module">
+const MP = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
+const MODEL = 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
+const $ = id => document.getElementById(id);
+const video = $('video'), canvas = $('canvas'), g = canvas.getContext('2d');
+
+// Tested on a real webcam (un-mirrored frames): the tasks-vision label already names
+// the person's real hand, so use it as-is. (Older docs say it is swapped — it is not here.)
+function side(label) { return label === 'Right' ? 'right' : 'left'; }
+
+// Palm or back of the hand: which way wrist→index-knuckle turns to wrist→pinky-knuckle.
+// For a real right hand showing its palm to the camera this cross product is negative
+// (raw, un-mirrored image coordinates); the back of the hand, or a left palm, flips it.
+function facing(L, s) {
+  const ax = L[5].x - L[0].x, ay = L[5].y - L[0].y;
+  const bx = L[17].x - L[0].x, by = L[17].y - L[0].y;
+  const cross = ax * by - ay * bx;
+  const palm = s === 'right' ? cross < 0 : cross > 0;
+  return palm ? 'palm' : 'back';
+}
+
+const TH = { left: 'มือซ้าย', right: 'มือขวา', palm: 'ฝ่ามือ', back: 'หลังมือ' };
+const COLOR = { left: '#5aa9ff', right: '#3ddc84' };
+
+// ---- which fingers are up ------------------------------------------------
+// Fingers: add up how much the two middle joints bend (0° = dead straight, ~180° = curled).
+// Angles come from MediaPipe's 3-D "world" landmarks, so a finger pointing at the camera
+// or a hand tilted away still measures right (2-D distances shrink in those poses).
+// Thumb: tip-to-index-knuckle distance / hand size (0 when the thumb tucks in).
+const FINGERS = [
+  { name: 'โป้ง', tip: 4 },
+  { name: 'ชี้',  tip: 8,  j: [5, 6, 7, 8] },
+  { name: 'กลาง', tip: 12, j: [9, 10, 11, 12] },
+  { name: 'นาง',  tip: 16, j: [13, 14, 15, 16] },
+  { name: 'ก้อย', tip: 20, j: [17, 18, 19, 20] },
+];
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+function bendDeg(W, a, b, c) {          // angle between a→b and b→c
+  const u = [W[b].x - W[a].x, W[b].y - W[a].y, (W[b].z || 0) - (W[a].z || 0)];
+  const v = [W[c].x - W[b].x, W[c].y - W[b].y, (W[c].z || 0) - (W[b].z || 0)];
+  const dot = u[0] * v[0] + u[1] * v[1] + u[2] * v[2];
+  const n = Math.hypot(...u) * Math.hypot(...v) || 1e-9;
+  return Math.acos(Math.max(-1, Math.min(1, dot / n))) * 180 / Math.PI;
+}
+function fingerValues(L, W) {           // thumb: ratio (bigger = out); others: bend in degrees (smaller = straight)
+  W = W || L;
+  const size = dist(L[0], L[9]) || 1e-6;
+  return FINGERS.map(f => {
+    if (!f.j) {
+      const out = dist(L[4], L[17]) > dist(L[3], L[17]);
+      return out ? dist(L[4], L[5]) / size : 0;
+    }
+    const [m, p, d, t] = f.j;
+    return bendDeg(W, m, p, d) + bendDeg(W, p, d, t);
+  });
+}
+// Hysteresis: a curled finger must straighten below UP_DEG to count as raised, and a raised
+// one must bend past DOWN_DEG to count as curled — the gap between them stops flicker.
+const THUMB_UP = 0.50, THUMB_DOWN = 0.38;
+const UP_DEG = 60, DOWN_DEG = 100;
+const fingerState = { left: null, right: null };
+function fingersUp(L, s, W) {
+  const v = fingerValues(L, W);
+  const prev = (s && fingerState[s]) || v.map(() => false);
+  const up = v.map((x, i) => i === 0
+    ? (prev[i] ? x > THUMB_DOWN : x > THUMB_UP)
+    : (prev[i] ? x < DOWN_DEG : x < UP_DEG));
+  if (s) fingerState[s] = up;
+  return up;
+}
+
+// Extra smoothing: a finger counts as up when it was up in most of the last 5 frames.
+const history = { left: [], right: [] };
+function stableFingers(s, up) {
+  const h = history[s]; h.push(up); if (h.length > 5) h.shift();
+  return up.map((_, i) => h.filter(f => f[i]).length * 2 > h.length);
+}
+
+// Handedness can flicker for a frame; that used to wipe the finger state and cause flicker.
+// One hand: majority of the last 8 labels. Two hands: labels if they differ, else position.
+const labelHist = [];
+function sides(res) {
+  const labels = (res.handednesses || []).map(h => side(h?.[0]?.categoryName));
+  const n = (res.landmarks || []).length;
+  if (n === 1) {
+    labelHist.push(labels[0]); if (labelHist.length > 8) labelHist.shift();
+    const r = labelHist.filter(x => x === 'right').length;
+    return [r * 2 >= labelHist.length ? 'right' : 'left'];
+  }
+  labelHist.length = 0;
+  if (n === 2 && labels[0] === labels[1]) {
+    const x0 = 1 - res.landmarks[0][0].x, x1 = 1 - res.landmarks[1][0].x;   // mirrored view
+    return x0 > x1 ? ['right', 'left'] : ['left', 'right'];
+  }
+  return labels;
+}
+
+// ---- gestures ------------------------------------------------------------
+// Built on the stable finger flags [thumb, index, middle, ring, pinky].
+const GESTURES = {
+  fist:   { emoji: '✊', name: 'กำมือ' },
+  open:   { emoji: '🖐', name: 'แบมือ' },
+  point:  { emoji: '☝️', name: 'ชี้' },
+  peace:  { emoji: '✌️', name: 'ชูสองนิ้ว' },
+  three:  { emoji: '🤟', name: 'สามนิ้ว' },
+  four:   { emoji: '🖖', name: 'สี่นิ้ว' },
+  ok:     { emoji: '👌', name: 'โอเค' },
+  thumbUp:   { emoji: '👍', name: 'ยกนิ้วโป้ง' },
+  thumbDown: { emoji: '👎', name: 'คว่ำนิ้วโป้ง' },
+  call:   { emoji: '🤙', name: 'โทรหา' },
+  rock:   { emoji: '🤘', name: 'ร็อก' },
+  gun:    { emoji: '👉', name: 'ปืน (โป้ง+ชี้)' },
+};
+function gestureOf(up, L) {
+  const key = up.map(b => (b ? 1 : 0)).join('');      // e.g. "01100" = index + middle
+  const size = dist(L[0], L[9]) || 1e-6;
+  // OK: thumb and index tips touch while middle, ring and pinky stay up
+  if (dist(L[4], L[8]) < 0.35 * size && up[2] && up[3] && up[4]) return 'ok';
+  switch (key) {
+    case '00000': return 'fist';
+    case '11111': return 'open';
+    case '01000': return 'point';
+    case '01100': return 'peace';
+    case '01110': return 'three';
+    case '01111': return 'four';
+    case '10001': return 'call';
+    case '01001': case '11001': return 'rock';
+    case '11000': return 'gun';
+    case '10000': return L[4].y < L[2].y ? 'thumbUp' : 'thumbDown';   // image y grows downward
+  }
+  return null;
+}
+// A gesture shows only after it has held for 6 frames (~0.2 s), so passing poses don't flash.
+const gestState = { left: { cand: null, n: 0, shown: null }, right: { cand: null, n: 0, shown: null } };
+function stableGesture(s, g) {
+  const st = gestState[s];
+  if (g === st.cand) st.n++; else { st.cand = g; st.n = 1; }
+  if (st.n >= 6) st.shown = g;
+  return st.shown;
+}
+
+// Keep a hand's state through short dropouts; reset only after it is gone ~10 frames.
+const missing = { left: 0, right: 0 };
+// Range of each value over the last 2 s, shown on screen to help set thresholds.
+const recent = { left: [], right: [] };
+
+function classify(res) {
+  const ss = sides(res), seen = new Set(), now = performance.now();
+  const hands = (res.landmarks || []).map((L, i) => {
+    const s = ss[i], W = res.worldLandmarks?.[i];
+    seen.add(s);
+    const h = res.handednesses?.[i]?.[0] || {};
+    const values = fingerValues(L, W);
+    const rec = recent[s]; rec.push({ t: now, v: values });
+    while (rec.length && now - rec[0].t > 2000) rec.shift();
+    const range = values.map((_, k) => [Math.min(...rec.map(r => r.v[k])), Math.max(...rec.map(r => r.v[k]))]);
+    const up = stableFingers(s, fingersUp(L, s, W));
+    const gesture = stableGesture(s, gestureOf(up, L));
+    return { L, side: s, facing: facing(L, s), score: h.score ?? 0, up, count: up.filter(Boolean).length, values, range, gesture };
+  });
+  for (const s of ['left', 'right']) {
+    if (seen.has(s)) missing[s] = 0;
+    else if (++missing[s] > 10) { history[s] = []; fingerState[s] = null; recent[s] = []; gestState[s] = { cand: null, n: 0, shown: null }; }
+  }
+  return hands;
+}
+
+const BONES = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+function draw(hands) {
+  const W = canvas.width, H = canvas.height;
+  g.save(); g.translate(W, 0); g.scale(-1, 1); g.drawImage(video, 0, 0, W, H); g.restore();  // mirror like a selfie
+  for (const h of hands) {
+    const P = i => [(1 - h.L[i].x) * W, h.L[i].y * H];
+    g.strokeStyle = COLOR[h.side]; g.lineWidth = 3;
+    for (const [a, b] of BONES) { const [x1, y1] = P(a), [x2, y2] = P(b); g.beginPath(); g.moveTo(x1, y1); g.lineTo(x2, y2); g.stroke(); }
+    FINGERS.forEach((f, i) => {                       // raised fingertips glow yellow
+      const [x, y] = P(f.tip);
+      g.fillStyle = h.up[i] ? '#ffd166' : 'rgba(255,255,255,.25)';
+      g.beginPath(); g.arc(x, y, h.up[i] ? 9 : 5, 0, 7); g.fill();
+    });
+    const [wx, wy] = P(0);
+    g.font = 'bold 22px system-ui'; g.textAlign = 'center';
+    g.lineWidth = 4; g.strokeStyle = '#000';
+    const gs = h.gesture && GESTURES[h.gesture];
+    const text = gs ? `${gs.emoji} ${gs.name}` : `${TH[h.side]} · ${h.count} นิ้ว`;
+    g.strokeText(text, wx, wy + 32); g.fillStyle = COLOR[h.side]; g.fillText(text, wx, wy + 32);
+  }
+  drawControlOverlay(W, H);
+  const order = { left: 0, right: 1 };
+  const shown = [...hands].sort((a, b) => order[a.side] - order[b.side]);
+  $('readout').textContent = shown.length
+    ? shown.map(h => {
+        const gs = h.gesture && GESTURES[h.gesture];
+        return `${TH[h.side]}: ${gs ? gs.emoji + ' ' + gs.name : '?'} (${h.count} นิ้ว)`;
+      }).join('   ')
+    : 'ไม่เห็นมือ';
+  $('detail').textContent = shown.map(h =>
+    `${TH[h.side]} (${TH[h.facing]}): ` + (FINGERS.filter((_, i) => h.up[i]).map(f => f.name).join(' ') || 'กำมือ')
+  ).join('  |  ');
+  $('debug').textContent = shown.map(h =>
+    `${TH[h.side]}: ` + FINGERS.map((f, i) => i === 0
+      ? `${f.name} ${h.values[i].toFixed(2)} (${h.range[i][0].toFixed(2)}–${h.range[i][1].toFixed(2)})`
+      : `${f.name} ${Math.round(h.values[i])}° (${Math.round(h.range[i][0])}–${Math.round(h.range[i][1])})`).join('  ')
+  ).join('   |   ');
+}
+
+let tracker = null, lastVT = -1;
+async function start() {
+  $('startBtn').disabled = true;
+  try {
+    $('status').textContent = 'กำลังโหลดโมเดล…';
+    const vision = await import(`${MP}/vision_bundle.mjs`);
+    const files = await vision.FilesetResolver.forVisionTasks(`${MP}/wasm`);
+    const make = delegate => vision.HandLandmarker.createFromOptions(files, {
+      baseOptions: { modelAssetPath: MODEL, delegate }, runningMode: 'VIDEO', numHands: 2,
+    });
+    try { tracker = await make('GPU'); } catch { tracker = await make('CPU'); }
+    video.srcObject = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480, facingMode: 'user' }, audio: false });
+    await video.play();
+    $('status').textContent = 'กล้องเปิดแล้ว — ยกมือให้กล้องเห็น';
+    requestAnimationFrame(loop);
+  } catch (e) {
+    $('status').textContent = 'เปิดกล้องไม่ได้: ' + (e.message || e);
+    $('startBtn').disabled = false;
+  }
+}
+function loop() {
+  const t = performance.now();
+  if (video.readyState >= 2 && video.currentTime !== lastVT) {
+    lastVT = video.currentTime;
+    const hands = classify(tracker.detectForVideo(video, t));
+    control(hands, t);
+    draw(hands);
+  }
+  requestAnimationFrame(loop);
+}
+// ---- mouse control (step 1: right-hand ☝️ moves the cursor, nothing else) -----------
+// Trackpad style: while the right hand holds ☝️, the cursor moves by how far the fingertip
+// moves. Any other pose lets go (like lifting a finger off a trackpad) so you can reposition.
+const WS_URL = 'ws://127.0.0.1:8765';
+const BASE_GAIN = 1600;          // screen points per full camera width, before acceleration
+const DEAD = 0.002;              // ignore fingertip jitter smaller than this (camera fraction)
+let ws = null;
+let retry = null;
+function connect() {
+  clearTimeout(retry);
+  if (ws && ws.readyState <= 1) return;        // already connecting / connected: never open a second socket
+  const sock = new WebSocket(WS_URL);
+  ws = sock;
+  sock.onopen = () => { $('wsState').textContent = 'bridge: เชื่อมแล้ว'; $('wsState').className = 'pill on'; };
+  sock.onerror = () => sock.close();
+  sock.onclose = e => {
+    if (sock !== ws) return;                   // an old socket of this tab: ignore
+    $('wsState').className = 'pill bad';
+    if (e.code === 4000) {             // a newer tab took over the bridge: stay off so tabs don't fight
+      $('wsState').textContent = 'bridge: แท็บอื่นใช้อยู่ (กดเปิดควบคุมเพื่อใช้แท็บนี้)';
+      setControl(false);
+      return;
+    }
+    $('wsState').textContent = 'bridge: ไม่ได้เชื่อม'; retry = setTimeout(connect, 1000);
+  };
+}
+const send = m => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(m)); };
+
+class OneEuro {                  // smooth when slow, responsive when fast
+  constructor(minCutoff = 1.2, beta = 8, dCutoff = 1.0) { Object.assign(this, { minCutoff, beta, dCutoff }); this.x = null; }
+  static a(cut, dt) { const r = 2 * Math.PI * cut * dt; return r / (r + 1); }
+  f(x, dt) {
+    if (this.x === null) { this.x = x; this.dx = 0; return x; }
+    const dx = (x - this.x) / dt;
+    this.dx += OneEuro.a(this.dCutoff, dt) * (dx - this.dx);
+    this.x += OneEuro.a(this.minCutoff + this.beta * Math.abs(this.dx), dt) * (x - this.x);
+    return this.x;
+  }
+  reset() { this.x = null; }
+}
+// Absolute mode ("เมาส์ตรงนิ้ว"): the yellow box on the camera picture IS the screen — the
+// fingertip's spot inside the box is the cursor's spot on the screen. Calibrate fits the box
+// to your comfortable reach so every screen edge is reachable without leaving the frame.
+const DEFAULT_BOX = { x0: 0.25, x1: 0.75, y0: 0.15, y1: 0.60 };   // mirrored camera fractions
+const STORE = 'hand-side-control-v1';
+function loadSaved() { try { return JSON.parse(localStorage.getItem(STORE)) || {}; } catch { return {}; } }
+function saveCtl() { try { localStorage.setItem(STORE, JSON.stringify({ box: ctl.box, mode: ctl.mode })); } catch {} }
+const saved = loadSaved();
+const ctl = {
+  on: false, mode: saved.mode || 'abs', box: saved.box || { ...DEFAULT_BOX },
+  anchor: null, lastT: 0, rx: 0, ry: 0, fx: new OneEuro(), fy: new OneEuro(),
+  cursor: null,        // where the cursor is, as 0..1 of the screen (absolute mode)
+  calib: null,         // { until, xs, ys } while calibrating
+};
+function setControl(on) {
+  ctl.on = on;
+  if (on && (!ws || ws.readyState > 1)) connect();   // turning control on takes the bridge back
+  $('ctlBtn').textContent = on ? 'ปิดควบคุมเมาส์ (Space)' : 'เปิดควบคุมเมาส์ (Space)';
+  $('ctlBtn').style.background = on ? '#3ddc84' : '';
+  $('ctlBtn').style.color = on ? '#000' : '';
+  letGo();
+}
+function letGo() { ctl.anchor = null; ctl.cursor = null; ctl.lastT = 0; ctl.rx = ctl.ry = 0; ctl.fx.reset(); ctl.fy.reset(); }
+
+function control(hands, t) {
+  const R = hands.find(h => h.side === 'right');
+  if (ctl.calib) { calibStep(R, t); return; }
+  const pointing = ctl.on && R && R.gesture === 'point';
+  const linked = ws && ws.readyState === 1;
+  $('moving').textContent = ctl.on && !linked ? '⚠️ ยังไม่ได้เชื่อม bridge — เมาส์จะไม่ขยับ'
+    : pointing ? '🖱 กำลังขยับเมาส์' : (ctl.on ? 'ทำท่า ☝️ ด้วยมือขวาเพื่อขยับ' : '');
+  if (!pointing) { letGo(); return; }
+  const dt = ctl.lastT ? Math.max((t - ctl.lastT) / 1000, 1 / 120) : 1 / 30;
+  ctl.lastT = t;
+  const x = ctl.fx.f(1 - R.L[8].x, dt), y = ctl.fy.f(R.L[8].y, dt);   // fingertip, mirrored
+  if (ctl.mode === 'abs') {
+    const b = ctl.box;
+    const nx = Math.min(Math.max((x - b.x0) / (b.x1 - b.x0), 0), 1);
+    const ny = Math.min(Math.max((y - b.y0) / (b.y1 - b.y0), 0), 1);
+    ctl.cursor = { x: nx, y: ny };
+    send({ t: 'move', x: nx, y: ny });
+    return;
+  }
+  if (!ctl.anchor) { ctl.anchor = { x, y }; return; }
+  const dx = x - ctl.anchor.x, dy = y - ctl.anchor.y, d = Math.hypot(dx, dy);
+  if (d < DEAD) return;                                // too small: wait until it adds up
+  const speed = d / dt;                                // camera widths per second
+  const accel = Math.min(Math.max(0.5 + speed * 1.5, 0.5), 3);   // slow = precise, fast = far
+  const gain = BASE_GAIN * Number($('speed').value) * accel;
+  ctl.rx += dx * gain; ctl.ry += dy * gain;
+  const mx = Math.trunc(ctl.rx), my = Math.trunc(ctl.ry);        // send whole points, keep the rest
+  ctl.rx -= mx; ctl.ry -= my;
+  if (mx || my) send({ t: 'rel', dx: mx, dy: my });
+  ctl.anchor = { x, y };
+}
+// ---- calibration: trace the biggest comfortable rectangle with the right index fingertip ----
+const CALIB_MS = 5000;
+function startCalib() {
+  letGo();
+  ctl.calib = { until: performance.now() + CALIB_MS, xs: [], ys: [] };
+  $('moving').textContent = 'กำลัง calibrate — ใช้ปลายนิ้วชี้ขวาวาดสี่เหลี่ยมใหญ่ที่สุดที่ทำได้สบาย ๆ';
+}
+function calibStep(R, t) {
+  if (R) { ctl.calib.xs.push(1 - R.L[8].x); ctl.calib.ys.push(R.L[8].y); }
+  if (t < ctl.calib.until) return;
+  const { xs, ys } = ctl.calib; ctl.calib = null;
+  const q = (a, p) => { const s = [...a].sort((m, n) => m - n); return s[Math.floor(p * (s.length - 1))]; };
+  if (xs.length < 30) { $('moving').textContent = 'calibrate ไม่สำเร็จ: ไม่เห็นมือขวา'; return; }
+  const x0 = q(xs, 0.03), x1 = q(xs, 0.97), y0 = q(ys, 0.03), y1 = q(ys, 0.97);
+  if (x1 - x0 < 0.12 || y1 - y0 < 0.10) { $('moving').textContent = 'calibrate ไม่สำเร็จ: วาดให้กว้างกว่านี้'; return; }
+  const ix = (x1 - x0) * 0.04, iy = (y1 - y0) * 0.04;      // shrink a little so the edges are easy to reach
+  ctl.box = { x0: x0 + ix, x1: x1 - ix, y0: y0 + iy, y1: y1 - iy };
+  saveCtl();
+  $('moving').textContent = 'calibrate เสร็จแล้ว ✓';
+}
+
+// Yellow box = the screen; red dot = where the cursor is on it.
+function drawControlOverlay(W, H) {
+  if (ctl.mode !== 'abs' && !ctl.calib) return;
+  const b = ctl.box;
+  g.strokeStyle = ctl.calib ? '#ff6b6b' : '#ffd166'; g.lineWidth = 2; g.setLineDash([6, 6]);
+  g.strokeRect(b.x0 * W, b.y0 * H, (b.x1 - b.x0) * W, (b.y1 - b.y0) * H); g.setLineDash([]);
+  if (ctl.calib) {
+    g.fillStyle = '#ff6b6b'; g.font = 'bold 20px system-ui'; g.textAlign = 'center';
+    g.fillText(`CALIBRATE ${Math.ceil((ctl.calib.until - performance.now()) / 1000)}`, W / 2, 30);
+    g.textAlign = 'left';
+  } else if (ctl.cursor) {
+    const cx = (b.x0 + ctl.cursor.x * (b.x1 - b.x0)) * W, cy = (b.y0 + ctl.cursor.y * (b.y1 - b.y0)) * H;
+    g.fillStyle = '#ff6b6b'; g.beginPath(); g.arc(cx, cy, 6, 0, 7); g.fill();
+  }
+}
+
+function setMode(m) {
+  ctl.mode = m; $('mode').value = m;
+  $('speedBox').style.display = m === 'rel' ? '' : 'none';
+  $('calibBtn').style.display = m === 'abs' ? '' : 'none';
+  letGo(); saveCtl();
+}
+$('mode').onchange = () => setMode($('mode').value);
+$('calibBtn').onclick = startCalib;
+setMode(ctl.mode);
+
+$('ctlBtn').onclick = () => setControl(!ctl.on);
+$('speed').oninput = () => { $('speedVal').textContent = Number($('speed').value).toFixed(1); };
+addEventListener('keydown', e => { if (e.code === 'Space') { e.preventDefault(); setControl(!ctl.on); } });
+document.addEventListener('visibilitychange', () => { if (document.hidden) letGo(); });
+connect();
+
+$('startBtn').onclick = start;
+window.__hs = { classify, fingersUp, fingerValues, gestureOf, control, ctl, setControl, setMode, startCalib };  // test hooks
+</script>
+</body>
+</html>

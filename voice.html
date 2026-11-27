@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Record Voice</title>
+<style>
+  body { margin: 0; background: #fff7e6; color: #2b2b2b; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 24px 16px 60px; }
+  a.back { color: #8a6d3b; text-decoration: none; }
+  h1 { color: #8a4b00; margin: 12px 0 4px; }
+  .lead { color: #6b5a3a; margin: 0 0 20px; line-height: 1.6; }
+  h2 { font-size: 18px; color: #8a4b00; margin: 26px 0 8px; }
+  .row { display: flex; align-items: center; gap: 10px; padding: 10px 12px; background: #fff; border-radius: 14px; margin-bottom: 8px; box-shadow: 0 1px 3px rgba(0,0,0,.06); }
+  .say { flex: 1; font-size: 20px; }
+  .ok { width: 1.4em; text-align: center; color: #3a9a1a; font-weight: 700; }
+  button { font-size: 16px; padding: 8px 14px; border-radius: 10px; border: 1px solid #e3d3b0; background: #fffaf0; cursor: pointer; }
+  button.rec { background: #ff595e; color: #fff; border-color: #ff595e; min-width: 6.5em; }
+  button.rec.on { background: #c1121f; animation: blink 1s infinite; }
+  @keyframes blink { 50% { opacity: .6; } }
+  button:disabled { opacity: .4; cursor: default; }
+  #status { position: sticky; top: 0; background: #fff7e6; padding: 8px 0; color: #8a6d3b; min-height: 1.4em; }
+</style>
+</head>
+<body>
+<main>
+  <a class="back" href="count.html">← กลับไปเกมนับนิ้ว</a>
+  <h1>🎙 อัดเสียงของคุณเอง</h1>
+  <p class="lead">กด <b>● อัด</b> แล้วพูดประโยคนั้น กดอีกครั้งเพื่อหยุด (หยุดเองใน 4 วินาที) · กด ▶ เพื่อฟัง<br>
+    เสียงเก็บไว้ในเบราว์เซอร์เครื่องนี้เท่านั้น ไม่ได้ส่งไปไหน · อัดไม่ครบก็ได้ ข้อที่ไม่ได้อัดเกมจะเงียบไว้</p>
+  <div id="status"></div>
+  <div id="list"></div>
+</main>
+
+<script type="module">
+// ---- phrases the count game uses (ids must match count.html) ------------------------
+const GROUPS = [
+  ['ชวนนับ (ตอนขึ้นข้อใหม่)', [['ask_1', 'มีกี่อันน้า? นับให้หน่อยจ้า'], ['ask_2', 'ชูนิ้วให้เท่ากันนะจ๊ะ']]],
+  ['ชมเมื่อตอบถูก (จะพูดต่อด้วยตัวเลข)', [['cheer_1', 'เย้! ถูกต้องจ้า'], ['cheer_2', 'เก่งมากเลย!'], ['cheer_3', 'ว้าว สุดยอด!']]],
+  ['ตัวเลข', [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map(n => [`num_${n}`, ['หนึ่ง', 'สอง', 'สาม', 'สี่', 'ห้า', 'หก', 'เจ็ด', 'แปด', 'เก้า', 'สิบ'][n - 1]])],
+  ['ให้กำลังใจ (เมื่อยังไม่ตอบ)', [['help_1', 'ค่อย ๆ นับทีละอันนะ'], ['help_2', 'ลองอีกนิดนะ สู้ ๆ']]],
+  ['จบเกม', [['finish', 'เก่งที่สุดเลย ได้ดาวครบแล้วจ้า']]],
+];
+
+// ---- tiny IndexedDB store: { id, blob } ------------------------------------------------
+const DB = 'hand-play-voice', STORE = 'clips';
+const open = () => new Promise((res, rej) => {
+  const r = indexedDB.open(DB, 1);
+  r.onupgradeneeded = () => r.result.createObjectStore(STORE, { keyPath: 'id' });
+  r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+});
+async function tx(mode, fn) {
+  const db = await open();
+  return new Promise((res, rej) => {
+    const t = db.transaction(STORE, mode), out = fn(t.objectStore(STORE));
+    t.oncomplete = () => res(out?.result); t.onerror = () => rej(t.error);
+  });
+}
+const putClip = (id, blob) => tx('readwrite', s => s.put({ id, blob }));
+const delClip = id => tx('readwrite', s => s.delete(id));
+const allIds = () => tx('readonly', s => s.getAllKeys());
+const getClip = id => tx('readonly', s => s.get(id));
+
+// ---- UI --------------------------------------------------------------------------------
+const $ = id => document.getElementById(id);
+const status = t => { $('status').textContent = t; };
+let have = new Set();
+function render() {
+  $('list').innerHTML = GROUPS.map(([title, items]) => `<h2>${title}</h2>` + items.map(([id, text]) => `
+    <div class="row" data-id="${id}">
+      <span class="ok">${have.has(id) ? '✓' : ''}</span>
+      <span class="say">${text}</span>
+      <button class="rec">● อัด</button>
+      <button class="play" ${have.has(id) ? '' : 'disabled'}>▶ ฟัง</button>
+      <button class="del" ${have.has(id) ? '' : 'disabled'}>🗑</button>
+    </div>`).join('')).join('');
+  const total = GROUPS.reduce((n, [, i]) => n + i.length, 0);
+  status(`อัดแล้ว ${have.size} / ${total} ประโยค`);
+}
+
+let stream = null, rec = null, recId = null, stopTimer = null;
+async function startRec(id, btn) {
+  try { stream = stream || await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } }); }
+  catch (e) { status('เปิดไมค์ไม่ได้: ' + (e.message || e)); return; }
+  const chunks = [];
+  rec = new MediaRecorder(stream); recId = id;
+  rec.ondataavailable = e => e.data.size && chunks.push(e.data);
+  rec.onstop = async () => {
+    btn.classList.remove('on'); btn.textContent = '● อัด';
+    const blob = new Blob(chunks, { type: rec.mimeType || 'audio/webm' });
+    rec = null; recId = null; clearTimeout(stopTimer);
+    if (blob.size < 1500) { status('สั้นเกินไป ลองอัดใหม่'); return; }
+    await putClip(id, blob); have.add(id); render(); play(id);
+  };
+  rec.start(); btn.classList.add('on'); btn.textContent = '■ หยุด';
+  status('กำลังอัด… พูดได้เลย');
+  stopTimer = setTimeout(() => rec && rec.stop(), 4000);
+}
+async function play(id) {
+  const c = await getClip(id); if (!c) return;
+  const a = new Audio(URL.createObjectURL(c.blob)); a.play();
+}
+
+$('list').addEventListener('click', async e => {
+  const btn = e.target.closest('button'); if (!btn) return;
+  const id = btn.closest('.row').dataset.id;
+  if (btn.classList.contains('rec')) {
+    if (rec && recId === id) { rec.stop(); return; }
+    if (rec) return;                       // one recording at a time
+    startRec(id, btn);
+  } else if (btn.classList.contains('play')) play(id);
+  else if (btn.classList.contains('del')) { await delClip(id); have.delete(id); render(); }
+});
+
+have = new Set(await allIds().catch(() => []));
+render();
+window.__voice = { putClip, allIds, delClip };   // test hook
+</script>
+</body>
+</html>

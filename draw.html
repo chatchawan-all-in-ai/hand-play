@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Air Drawing</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #fffdf7; overflow: hidden; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  video { display: none; }
+  #overlay { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px; text-align: center; background: rgba(255, 253, 247, .96); color: #5a3e1b; }
+  #overlay.hidden { display: none; }
+  #overlay h1 { font-size: clamp(40px, 7vw, 66px); margin: 0; }
+  #overlay p { font-size: 21px; margin: 0; max-width: 740px; line-height: 1.6; }
+  #overlay button { font-size: 28px; padding: 14px 40px; border: 0; border-radius: 999px; cursor: pointer; font-weight: 700; background: #ff924c; color: #3a1500; }
+  #overlay button:disabled { opacity: .5; }
+  #msg { color: #8a6d3b; min-height: 1.4em; }
+  a { color: #8a6d3b; font-size: 18px; }
+</style>
+</head>
+<body>
+<video id="video" playsinline muted></video>
+<canvas id="canvas"></canvas>
+<div id="overlay">
+  <h1>🎨 วาดรูปกลางอากาศ</h1>
+  <p><b>☝️ ชูนิ้วชี้</b> = วาด เส้นออกตรงปลายนิ้วเลย · <b>✊ กำมือ / ✌️ ชูสองนิ้ว</b> = ยกปากกา<br>
+    <b>วาดพร้อมกันได้ถึง 4 มือ</b> — แต่ละมือเป็นปากกาของตัวเอง เลือกสีและขนาดเองได้<br>
+    เลือกสีทางซ้าย · ขนาด ยางลบ ย้อนกลับ ลบหมด บันทึก ทางขวา — ชี้ค้างไว้ที่ปุ่มเพื่อเลือก</p>
+  <button id="startBtn">เริ่มวาด!</button>
+  <div id="msg"></div>
+  <a href="./">← กลับหน้าหลัก</a>
+</div>
+
+<script type="module">
+const MP = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
+const MODEL = 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
+const MAX_PENS = 4, DWELL_MS = 550, CLEAR_MS = 1500, UNDO_MAX = 20, LOST_MS = 150;
+const COLORS = ['#e63946', '#ff924c', '#ffca3a', '#8ac926', '#1982c4', '#6a4c93', '#ff70a6', '#6d4c41', '#222222', 'rainbow'];
+const PEN_START_COLOR = [0, 4, 3, 5];       // each new hand starts with a different colour: red, blue, green, purple
+const SIZES = [6, 14, 28];
+
+const $ = id => document.getElementById(id);
+const video = $('video'), canvas = $('canvas'), g = canvas.getContext('2d');
+const art = document.createElement('canvas'), a = art.getContext('2d');    // the drawing itself, kept separately
+let W = 0, H = 0;
+function resize() {
+  const nw = innerWidth, nh = innerHeight; if (nw === W && nh === H) return;
+  const keep = W && H ? a.getImageData(0, 0, W, H) : null;
+  W = canvas.width = art.width = nw; H = canvas.height = art.height = nh;
+  if (keep) a.putImageData(keep, 0, 0);
+}
+// The line goes exactly where the fingertip is in the (mirrored) camera picture — no reach scaling.
+function toScreen(p) {
+  const vw = video.videoWidth || 640, vh = video.videoHeight || 480;
+  const s = Math.max(W / vw, H / vh), ox = (W - vw * s) / 2, oy = (H - vh * s) / 2;
+  return { x: W - (ox + p.x * vw * s), y: oy + p.y * vh * s };
+}
+// One Euro filter: almost no smoothing while the finger moves (no lag), more when still (no jitter)
+class OneEuro {
+  constructor(minCutoff = 1.5, beta = 0.02) { this.minCutoff = minCutoff; this.beta = beta; this.x = null; this.dx = 0; }
+  static a(cut, dt) { const r = 2 * Math.PI * cut * dt; return r / (r + 1); }
+  f(x, dt) {
+    if (this.x === null) { this.x = x; return x; }
+    this.dx += OneEuro.a(1, dt) * ((x - this.x) / dt - this.dx);
+    this.x += OneEuro.a(this.minCutoff + this.beta * Math.abs(this.dx), dt) * (x - this.x);
+    return this.x;
+  }
+  reset() { this.x = null; this.dx = 0; }
+}
+
+// ---- finger state (3-D bend angle + hysteresis) ---------------------------------------------------
+const JOINTS = [[5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16], [17, 18, 19, 20]];
+function bendDeg(Wl, a1, b, c) {
+  const u = [Wl[b].x - Wl[a1].x, Wl[b].y - Wl[a1].y, (Wl[b].z || 0) - (Wl[a1].z || 0)];
+  const v = [Wl[c].x - Wl[b].x, Wl[c].y - Wl[b].y, (Wl[c].z || 0) - (Wl[b].z || 0)];
+  const n = Math.hypot(...u) * Math.hypot(...v) || 1e-9;
+  return Math.acos(Math.max(-1, Math.min(1, (u[0] * v[0] + u[1] * v[1] + u[2] * v[2]) / n))) * 180 / Math.PI;
+}
+const fingersFrom = (Wl, prev) => JOINTS.map(([m, p, d, t], i) => { const b = bendDeg(Wl, m, p, d) + bendDeg(Wl, p, d, t); return prev[i] ? b < 100 : b < 60; });
+const poseOf = f => (f[0] && !f[1] && !f[2] && !f[3] ? 'draw' : 'lift');
+
+// ---- pens: one per hand. MediaPipe gives no hand IDs, so each frame's hands are matched to the
+// pens by nearest fingertip; a pen keeps its colour/size while its hand stays in view ---------------
+let nextColor = 0;
+function newPen() {
+  return { active: false, raw: null, pointer: null, pose: 'lift', fingers: [false, false, false, false], fx: new OneEuro(), fy: new OneEuro(),
+    lastT: 0, lostAt: 0, last: null, drawing: false, hue: Math.random() * 360, hoverBtn: null, hoverSince: 0,
+    tool: { color: 0, size: 1, eraser: false } };
+}
+const pens = Array.from({ length: MAX_PENS }, newPen);
+function activate(pen) {
+  Object.assign(pen, newPen(), { active: true });
+  pen.tool.color = PEN_START_COLOR[nextColor++ % PEN_START_COLOR.length];
+}
+// hands: [{ raw:{x,y}, Wl }] for this frame
+function updatePens(hands, t) {
+  const used = new Set(), maxJump = Math.max(W, H) * 0.25;
+  // greedy nearest matching: closest (pen, hand) pairs first
+  const pairs = [];
+  pens.forEach((p, pi) => { if (p.active && p.raw) hands.forEach((h, hi) => pairs.push({ pi, hi, d: Math.hypot(p.raw.x - h.raw.x, p.raw.y - h.raw.y) })); });
+  pairs.sort((x, y) => x.d - y.d);
+  const handPen = new Map();
+  for (const { pi, hi, d } of pairs) if (d < maxJump && !used.has(pi) && !handPen.has(hi)) { used.add(pi); handPen.set(hi, pi); }
+  hands.forEach((h, hi) => {                                         // new hands take a free pen
+    if (handPen.has(hi)) return;
+    const pi = pens.findIndex((p, k) => !used.has(k) && !p.active) >= 0 ? pens.findIndex((p, k) => !used.has(k) && !p.active)
+      : pens.findIndex((p, k) => !used.has(k));
+    if (pi < 0) return; activate(pens[pi]); used.add(pi); handPen.set(hi, pi);
+  });
+  pens.forEach((pen, pi) => {
+    const hi = [...handPen].find(([, p]) => p === pi)?.[0];
+    if (hi === undefined) {                                          // pen's hand not seen this frame
+      if (!pen.active) return;
+      if (!pen.lostAt) pen.lostAt = t;
+      if (t - pen.lostAt > LOST_MS) { pen.active = false; pen.pointer = null; pen.last = null; pen.drawing = false; }
+      return;                                                        // a short dropout changes nothing (stroke not broken)
+    }
+    const h = hands[hi];
+    pen.lostAt = 0; pen.raw = h.raw;
+    if (h.Wl) pen.fingers = fingersFrom(h.Wl, pen.fingers);
+    pen.pose = h.pose || poseOf(pen.fingers);
+    const dt = pen.lastT ? Math.max((t - pen.lastT) / 1000, 1 / 120) : 1 / 30; pen.lastT = t;
+    pen.pointer = { x: pen.fx.f(h.raw.x, dt), y: pen.fy.f(h.raw.y, dt) };
+    stepPen(pen, t);
+  });
+}
+
+// ---- toolbar: away from the screen edges so it is reachable without leaving the camera picture -------
+function buttons() {
+  const top = H * 0.1, span = H * 0.8, out = [];
+  const n = COLORS.length, r = Math.min(span / n / 2.4, 32), lx = W * 0.07 + r;
+  COLORS.forEach((c, i) => out.push({ kind: 'color', i, x: lx, y: top + span * (i + 0.5) / n, r }));
+  const items = [['size', 0], ['size', 1], ['size', 2], ['eraser'], ['undo'], ['clear'], ['save']];
+  const R = Math.min(span / items.length / 2.4, 38), rx = W * 0.93 - R;
+  items.forEach(([kind, i], k) => out.push({ kind, i, x: rx, y: top + span * (k + 0.5) / items.length, r: R }));
+  return out;
+}
+const btnAt = p => (p ? buttons().find(b => Math.hypot(p.x - b.x, p.y - b.y) < b.r + 10) : null);
+const inToolbar = p => { if (!p) return false; const bs = buttons(), L = bs[0], R = bs[bs.length - 1]; return p.x < L.x + L.r + 16 || p.x > R.x - R.r - 16; };
+
+// ---- undo + actions -----------------------------------------------------------------------------------
+const undo = [];
+const flash = { t: 0, text: '' };
+function snapshot() { undo.push(a.getImageData(0, 0, W, H)); if (undo.length > UNDO_MAX) undo.shift(); }
+function press(pen, b, t) {
+  const tl = pen.tool;
+  if (b.kind === 'color') { tl.color = b.i; tl.eraser = false; }
+  else if (b.kind === 'size') tl.size = b.i;
+  else if (b.kind === 'eraser') tl.eraser = !tl.eraser;
+  else if (b.kind === 'undo') { const s = undo.pop(); if (s) a.putImageData(s, 0, 0); }
+  else if (b.kind === 'save') saveImage();
+  else if (b.kind === 'clear') { snapshot(); a.clearRect(0, 0, W, H); Object.assign(flash, { t, text: 'ลบหมดแล้ว ✨' }); }
+  click();
+}
+function saveImage() {
+  const out = document.createElement('canvas'); out.width = W; out.height = H;
+  const o = out.getContext('2d'); o.fillStyle = '#fffdf7'; o.fillRect(0, 0, W, H); o.drawImage(art, 0, 0);
+  const d = new Date(), p2 = n => String(n).padStart(2, '0');
+  const link = document.createElement('a');
+  link.download = `my-drawing-${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}-${p2(d.getHours())}${p2(d.getMinutes())}.png`;
+  link.href = out.toDataURL('image/png'); link.click();
+  Object.assign(flash, { t: performance.now(), text: 'บันทึกรูปแล้ว 📸' });
+}
+
+// ---- sound ---------------------------------------------------------------------------------------------
+let actx = null;
+function click() {
+  if (!actx) return;
+  const t = actx.currentTime, o = actx.createOscillator(), v = actx.createGain();
+  o.type = 'triangle'; o.frequency.value = 880; v.gain.setValueAtTime(0.15, t); v.gain.exponentialRampToValueAtTime(0.001, t + 0.08);
+  o.connect(v).connect(actx.destination); o.start(t); o.stop(t + 0.09);
+}
+
+// ---- drawing ---------------------------------------------------------------------------------------------
+const penColor = pen => (pen.tool.eraser ? '#999' : COLORS[pen.tool.color] === 'rainbow' ? `hsl(${pen.hue} 90% 55%)` : COLORS[pen.tool.color]);
+const penSize = pen => SIZES[pen.tool.size] * (pen.tool.eraser ? 2.2 : 1);
+function strokeTo(pen, p) {
+  a.save(); a.lineCap = 'round'; a.lineJoin = 'round'; a.lineWidth = penSize(pen);
+  if (pen.tool.eraser) a.globalCompositeOperation = 'destination-out';
+  else { if (COLORS[pen.tool.color] === 'rainbow') pen.hue = (pen.hue + 4) % 360; a.strokeStyle = penColor(pen); }
+  a.beginPath();
+  const l = pen.last;
+  if (l) { a.moveTo(l.x, l.y); a.lineTo(p.x, p.y); }      // straight to the current fingertip: the line ends exactly under the finger
+  else { a.moveTo(p.x, p.y); a.lineTo(p.x + 0.1, p.y + 0.1); }
+  a.stroke(); a.restore();
+  pen.last = p;
+}
+// one pen, one tick (pointer + pose already set)
+function stepPen(pen, t) {
+  const p = pen.pointer;
+  const b = btnAt(p), key = b ? b.kind + b.i : null;                           // toolbar: hover to press
+  if (key !== pen.hoverBtn) { pen.hoverBtn = key; pen.hoverSince = t; }
+  else if (b && t - pen.hoverSince >= (b.kind === 'clear' ? CLEAR_MS : DWELL_MS)) { press(pen, b, t); pen.hoverSince = Infinity; }
+  if (pen.pose === 'draw' && !inToolbar(p)) {
+    if (!pen.drawing) { if (!pens.some(o => o !== pen && o.drawing)) snapshot(); pen.drawing = true; pen.last = null; }
+    strokeTo(pen, { x: p.x, y: p.y });
+  } else { pen.drawing = false; pen.last = null; }
+}
+
+function draw(t) {
+  g.fillStyle = '#fffdf7'; g.fillRect(0, 0, W, H);
+  if (video.readyState >= 2) {
+    const vw = video.videoWidth, vh = video.videoHeight, s = Math.max(W / vw, H / vh);
+    g.save(); g.globalAlpha = 0.32; g.translate(W, 0); g.scale(-1, 1); g.drawImage(video, (W - vw * s) / 2, (H - vh * s) / 2, vw * s, vh * s); g.restore();
+  }
+  g.drawImage(art, 0, 0);
+  const live = pens.filter(p => p.active && p.pointer);
+  for (const b of buttons()) {
+    const key = b.kind + b.i, lim = b.kind === 'clear' ? CLEAR_MS : DWELL_MS;
+    const hov = live.filter(p => p.hoverBtn === key && Number.isFinite(p.hoverSince));
+    const k = hov.length ? Math.min(Math.max(...hov.map(p => t - p.hoverSince)) / lim, 1) : 0;
+    g.beginPath(); g.arc(b.x, b.y, b.r, 0, 7);
+    if (b.kind === 'color') {
+      if (COLORS[b.i] === 'rainbow') { const gr = g.createConicGradient(0, b.x, b.y); ['red', 'orange', 'yellow', 'lime', 'cyan', 'blue', 'magenta', 'red'].forEach((c, i) => gr.addColorStop(i / 7, c)); g.fillStyle = gr; }
+      else g.fillStyle = COLORS[b.i];
+      g.fill();
+    } else { g.fillStyle = '#ffffff'; g.fill(); g.lineWidth = 2; g.strokeStyle = '#e6d8bf'; g.stroke(); }
+    g.textAlign = 'center'; g.textBaseline = 'middle';
+    if (b.kind === 'size') { g.beginPath(); g.arc(b.x, b.y, SIZES[b.i] / 2 + 1, 0, 7); g.fillStyle = '#5a3e1b'; g.fill(); }
+    else if (b.kind !== 'color') { g.font = `${b.r}px system-ui`; g.fillStyle = '#5a3e1b'; g.fillText({ eraser: '🧽', undo: '↩️', clear: '🗑️', save: '💾' }[b.kind], b.x, b.y + 2); }
+    // little dots next to a button show which pens have it selected
+    const owners = live.filter(p => (b.kind === 'color' && !p.tool.eraser && p.tool.color === b.i) || (b.kind === 'size' && p.tool.size === b.i) || (b.kind === 'eraser' && p.tool.eraser));
+    owners.forEach((p, j) => { const side = b.kind === 'color' ? 1 : -1; g.beginPath(); g.arc(b.x + side * (b.r + 12 + j * 14), b.y, 6, 0, 7); g.fillStyle = penColor(p); g.fill(); g.lineWidth = 2; g.strokeStyle = '#5a3e1b'; g.stroke(); });
+    if (k > 0) { g.lineWidth = 6; g.strokeStyle = '#ff7b00'; g.beginPath(); g.arc(b.x, b.y, b.r + 8, -Math.PI / 2, -Math.PI / 2 + k * Math.PI * 2); g.stroke(); }
+  }
+  for (const pen of live) {                                       // cursors: filled dot = drawing, ring = pen lifted
+    const p = pen.pointer, col = penColor(pen), r = Math.max(penSize(pen) / 2, 8);
+    g.lineWidth = 3; g.strokeStyle = col; g.beginPath(); g.arc(p.x, p.y, r + (pen.pose === 'draw' ? 0 : 6), 0, 7);
+    if (pen.pose === 'draw' && !inToolbar(p)) { g.fillStyle = col; g.fill(); } else g.stroke();
+  }
+  if (!live.length) { g.fillStyle = '#8a6d3b'; g.font = '26px system-ui'; g.textAlign = 'center'; g.textBaseline = 'bottom'; g.fillText('ยกมือให้กล้องเห็น แล้วชูนิ้วชี้ ☝️ เพื่อวาด (ได้ถึง 4 มือ)', W / 2, H - 16); }
+  if (performance.now() - flash.t < 1500) {
+    const k = (performance.now() - flash.t) / 1500; g.globalAlpha = 1 - k; g.fillStyle = '#5a3e1b'; g.font = 'bold 48px system-ui';
+    g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillText(flash.text, W / 2, H / 2); g.globalAlpha = 1;
+  }
+  g.textBaseline = 'alphabetic';
+}
+
+// ---- camera + loop ------------------------------------------------------------------------------------
+let tracker = null, lastVT = -1;
+async function start() {
+  $('startBtn').disabled = true;
+  try {
+    $('msg').textContent = 'กำลังเปิดกล้อง…';
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const vision = await import(`${MP}/vision_bundle.mjs`);
+    const files = await vision.FilesetResolver.forVisionTasks(`${MP}/wasm`);
+    const make = delegate => vision.HandLandmarker.createFromOptions(files, { baseOptions: { modelAssetPath: MODEL, delegate }, runningMode: 'VIDEO', numHands: MAX_PENS });
+    try { tracker = await make('GPU'); } catch { tracker = await make('CPU'); }
+    video.srcObject = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720, facingMode: 'user' }, audio: false });
+    await video.play();
+    $('overlay').classList.add('hidden');
+    requestAnimationFrame(loop);
+  } catch (e) { $('msg').textContent = 'เปิดกล้องไม่ได้: ' + (e.message || e); $('startBtn').disabled = false; }
+}
+function loop(t) {
+  resize();
+  if (video.readyState >= 2 && video.currentTime !== lastVT) {    // one update per new camera frame
+    lastVT = video.currentTime;
+    const res = tracker.detectForVideo(video, t);
+    updatePens((res.landmarks || []).map((L, i) => ({ raw: toScreen(L[8]), Wl: res.worldLandmarks?.[i] || L })), t);
+  }
+  draw(t);
+  requestAnimationFrame(loop);
+}
+addEventListener('resize', resize); resize();
+$('startBtn').onclick = start;
+window.__draw = { updatePens, draw, pens, buttons, art, size: () => [W, H] };   // test hooks
+</script>
+</body>
+</html>

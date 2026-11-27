@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Memory Match</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #f3ecff; overflow: hidden; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  video { display: none; }
+  #overlay { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px; text-align: center; background: rgba(243, 236, 255, .95); color: #3d2a6b; }
+  #overlay.hidden { display: none; }
+  #overlay h1 { font-size: clamp(40px, 7vw, 66px); margin: 0; }
+  #overlay p { font-size: 21px; margin: 0; max-width: 680px; line-height: 1.55; }
+  .btns { display: flex; gap: 14px; flex-wrap: wrap; justify-content: center; }
+  #overlay button { font-size: 26px; padding: 12px 32px; border: 0; border-radius: 999px; cursor: pointer; font-weight: 700; }
+  #easyBtn { background: #8ac926; color: #10220a; }
+  #midBtn { background: #ffca3a; color: #3a2a00; }
+  #hardBtn { background: #ff924c; color: #3a1500; }
+  #overlay button:disabled { opacity: .5; }
+  #msg { color: #6b5a8f; min-height: 1.4em; }
+  a { color: #6b5a8f; font-size: 18px; }
+</style>
+</head>
+<body>
+<video id="video" playsinline muted></video>
+<canvas id="canvas"></canvas>
+<div id="overlay">
+  <h1>🧠 จับคู่ความจำ</h1>
+  <p>ใช้ <b>ปลายนิ้วชี้ ☝️</b> ชี้ค้างไว้ที่บัตรเพื่อเปิด<br>จำให้ได้ว่ารูปไหนอยู่ตรงไหน แล้วหาคู่ที่เหมือนกันให้ครบ!</p>
+  <div class="btns">
+    <button id="easyBtn">ง่าย · 6 ใบ</button>
+    <button id="midBtn">กลาง · 12 ใบ</button>
+    <button id="hardBtn">ยาก · 16 ใบ</button>
+  </div>
+  <div id="msg"></div>
+  <a href="./">← กลับหน้าหลัก</a>
+</div>
+
+<script type="module">
+const MP = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
+const MODEL = 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
+const DWELL_MS = 750, SHOW_MISS_MS = 1000;
+const PICS = ['🐶', '🐱', '🐰', '🐼', '🦁', '🐸', '🐵', '🐧', '🦄', '🐙', '🍓', '🍉'];
+const LEVELS = { easy: { cols: 3, rows: 2 }, mid: { cols: 4, rows: 3 }, hard: { cols: 4, rows: 4 } };
+const BEST = 'hand-play-memory-best';
+
+const $ = id => document.getElementById(id);
+const video = $('video'), canvas = $('canvas'), g = canvas.getContext('2d');
+let W = 0, H = 0;
+function resize() { W = canvas.width = innerWidth; H = canvas.height = innerHeight; layout(); }
+
+function toScreen(p) {                       // camera picture -> screen, "cover" fit, mirrored
+  const vw = video.videoWidth || 640, vh = video.videoHeight || 480;
+  const s = Math.max(W / vw, H / vh), ox = (W - vw * s) / 2, oy = (H - vh * s) / 2;
+  return { x: W - (ox + p.x * vw * s), y: oy + p.y * vh * s };
+}
+
+// ---- sound -------------------------------------------------------------------------------
+let actx = null;
+function tone(f, d = 0.12, delay = 0, type = 'sine', vol = 0.22) {
+  if (!actx) return;
+  const t = actx.currentTime + delay, o = actx.createOscillator(), v = actx.createGain();
+  o.type = type; o.frequency.value = f;
+  v.gain.setValueAtTime(vol, t); v.gain.exponentialRampToValueAtTime(0.001, t + d);
+  o.connect(v).connect(actx.destination); o.start(t); o.stop(t + d);
+}
+const flipSound = () => tone(700, 0.06, 0, 'triangle', 0.15);
+const matchSound = () => { tone(784); tone(1047, 0.15, 0.08); tone(1319, 0.25, 0.16); };
+const missSound = () => { tone(330, 0.15, 0, 'triangle', 0.15); tone(262, 0.2, 0.12, 'triangle', 0.15); };
+const winSound = () => [523, 659, 784, 1047, 784, 1047, 1319].forEach((f, i) => tone(f, 0.3, i * 0.11));
+
+// ---- game --------------------------------------------------------------------------------
+const game = { phase: 'idle', level: 'easy', cards: [], open: [], moves: 0, t0: 0, tEnd: 0, missUntil: 0, hover: -1, hoverSince: 0, pointer: null, sparkles: [] };
+function shuffle(a) { for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; }
+function layout() {
+  const lv = LEVELS[game.level], top = 110, pad = 16;
+  const cw = Math.min((W - pad * (lv.cols + 1)) / lv.cols, ((H - top - 30) - pad * (lv.rows - 1)) / lv.rows * 0.8);
+  const ch = cw * 1.25, gw = lv.cols * cw + (lv.cols - 1) * pad, gh = lv.rows * ch + (lv.rows - 1) * pad;
+  const x0 = (W - gw) / 2, y0 = top + Math.max(0, (H - top - 30 - gh) / 2);
+  game.cards.forEach((c, i) => { c.x = x0 + (i % lv.cols) * (cw + pad); c.y = y0 + Math.floor(i / lv.cols) * (ch + pad); c.w = cw; c.h = ch; });
+}
+function startGame(level, t) {
+  game.level = level;
+  const lv = LEVELS[level], pairs = (lv.cols * lv.rows) / 2;
+  const pics = shuffle([...PICS]).slice(0, pairs);
+  game.cards = shuffle([...pics, ...pics]).map(pic => ({ pic, up: false, done: false, flip: 0 }));
+  game.open = []; game.moves = 0; game.t0 = t; game.missUntil = 0; game.hover = -1; game.sparkles = [];
+  game.phase = 'play';
+  layout();
+  $('overlay').classList.add('hidden');
+}
+function cardAt(p) { return p ? game.cards.findIndex(c => p.x >= c.x && p.x <= c.x + c.w && p.y >= c.y && p.y <= c.y + c.h) : -1; }
+function choose(i, t) {
+  const c = game.cards[i];
+  if (c.up || c.done || game.open.length >= 2) return;
+  c.up = true; flipSound(); game.open.push(i);
+  if (game.open.length < 2) return;
+  game.moves++;
+  const [a, b] = game.open.map(k => game.cards[k]);
+  if (a.pic === b.pic) {
+    a.done = b.done = true; game.open = []; matchSound();
+    for (const k of [a, b]) for (let s = 0; s < 10; s++) game.sparkles.push({ x: k.x + k.w / 2, y: k.y + k.h / 2, a: Math.random() * 7, v: 80 + Math.random() * 120, t });
+    if (game.cards.every(k => k.done)) { game.phase = 'won'; game.tEnd = t; setTimeout(showWin, 900); }
+  } else { game.missUntil = t + SHOW_MISS_MS; missSound(); }
+}
+// one tick with the fingertip position (screen pixels) or null
+function step(pointer, t) {
+  game.pointer = pointer;
+  if (game.phase !== 'play') return;
+  if (game.missUntil && t >= game.missUntil) {                      // flip a wrong pair back down
+    game.open.forEach(k => (game.cards[k].up = false)); game.open = []; game.missUntil = 0;
+  }
+  const i = cardAt(pointer);
+  if (i !== game.hover) { game.hover = i; game.hoverSince = t; return; }
+  if (i >= 0 && !game.missUntil && t - game.hoverSince >= DWELL_MS) { choose(i, t); game.hoverSince = Infinity; }   // one pick per visit
+}
+function showWin() {
+  const secs = Math.round((game.tEnd - game.t0) / 1000), key = `${BEST}-${game.level}`;
+  let best = null; try { best = JSON.parse(localStorage.getItem(key)); } catch {}
+  const record = !best || game.moves < best.moves;
+  if (record) try { localStorage.setItem(key, JSON.stringify({ moves: game.moves, secs })); } catch {}
+  $('overlay').querySelector('h1').textContent = record ? 'สถิติใหม่! เก่งมาก 🏆' : 'จับคู่ครบแล้ว! เก่งมาก 🎉';
+  $('overlay').querySelector('p').innerHTML = `ใช้ <b>${game.moves}</b> ครั้ง · ${secs} วินาที` +
+    (best && !record ? `<br>สถิติระดับนี้: ${best.moves} ครั้ง` : '') + '<br>เล่นอีกรอบไหม?';
+  $('overlay').classList.remove('hidden');
+  winSound();
+}
+
+// ---- drawing ----------------------------------------------------------------------------
+function rrect(x, y, w, h, r) { g.beginPath(); g.moveTo(x + r, y); g.arcTo(x + w, y, x + w, y + h, r); g.arcTo(x + w, y + h, x, y + h, r); g.arcTo(x, y + h, x, y, r); g.arcTo(x, y, x + w, y, r); g.closePath(); }
+function draw(t) {
+  g.fillStyle = '#f3ecff'; g.fillRect(0, 0, W, H);
+  if (video.readyState >= 2) {                                      // faint mirrored camera so kids see themselves
+    const vw = video.videoWidth, vh = video.videoHeight, s = Math.max(W / vw, H / vh);
+    g.save(); g.globalAlpha = 0.18; g.translate(W, 0); g.scale(-1, 1); g.drawImage(video, (W - vw * s) / 2, (H - vh * s) / 2, vw * s, vh * s); g.restore();
+  }
+  g.fillStyle = '#3d2a6b'; g.font = 'bold 40px system-ui'; g.textBaseline = 'top';
+  g.textAlign = 'left'; g.fillText(`🧠 เปิดไป ${game.moves} ครั้ง`, 24, 30);
+  const left = game.cards.filter(c => !c.done).length / 2;
+  g.textAlign = 'right'; g.fillText(`เหลือ ${left} คู่`, W - 24, 30);
+  game.cards.forEach((c, i) => {
+    c.flip += ((c.up || c.done ? 1 : 0) - c.flip) * 0.25;             // flip animation 0 = back, 1 = face
+    const sx = Math.abs(Math.cos(c.flip * Math.PI)), face = c.flip > 0.5;
+    const w = c.w * Math.max(sx, 0.04), x = c.x + (c.w - w) / 2;
+    rrect(x, c.y, w, c.h, 18);
+    g.fillStyle = face ? (c.done ? '#d9f7c4' : '#ffffff') : '#8e6cf0'; g.fill();
+    g.lineWidth = i === game.hover && game.phase === 'play' ? 6 : 3;
+    g.strokeStyle = i === game.hover && game.phase === 'play' ? '#ffb703' : (face ? '#c9b8ff' : '#6a4fd0'); g.stroke();
+    g.textAlign = 'center'; g.textBaseline = 'middle';
+    if (face && sx > 0.3) { g.font = `${c.h * 0.5}px system-ui`; g.fillText(c.pic, c.x + c.w / 2, c.y + c.h / 2 + 4); }
+    else if (!face && sx > 0.3) { g.fillStyle = '#ffffffaa'; g.font = `bold ${c.h * 0.32}px system-ui`; g.fillText('?', c.x + c.w / 2, c.y + c.h / 2); }
+  });
+  // dwell ring around the fingertip
+  if (game.pointer) {
+    const p = game.pointer, k = game.hover >= 0 && Number.isFinite(game.hoverSince) && !game.missUntil
+      ? Math.min((t - game.hoverSince) / DWELL_MS, 1) : 0;
+    g.fillStyle = '#ffb703'; g.beginPath(); g.arc(p.x, p.y, 12, 0, 7); g.fill();
+    if (k > 0) { g.strokeStyle = '#ff7b00'; g.lineWidth = 7; g.beginPath(); g.arc(p.x, p.y, 30, -Math.PI / 2, -Math.PI / 2 + k * Math.PI * 2); g.stroke(); }
+  }
+  game.sparkles = game.sparkles.filter(s => t - s.t < 800);
+  for (const s of game.sparkles) {
+    const k = (t - s.t) / 800; g.globalAlpha = 1 - k; g.font = '26px system-ui';
+    g.fillText('✨', s.x + Math.cos(s.a) * s.v * k, s.y + Math.sin(s.a) * s.v * k); g.globalAlpha = 1;
+  }
+  if (game.phase === 'play' && !game.pointer) {
+    g.fillStyle = '#6b5a8f'; g.font = '26px system-ui'; g.textAlign = 'center'; g.textBaseline = 'bottom';
+    g.fillText('ยกมือชี้นิ้ว ☝️ ให้กล้องเห็น', W / 2, H - 16);
+  }
+  g.textBaseline = 'alphabetic';
+}
+
+// ---- camera + loop ------------------------------------------------------------------------
+let tracker = null, lastVT = -1, smooth = null, lostAt = 0;
+async function start(level) {
+  for (const b of ['easyBtn', 'midBtn', 'hardBtn']) $(b).disabled = true;
+  try {
+    if (!tracker) {
+      $('msg').textContent = 'กำลังเปิดกล้อง…';
+      actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+      const vision = await import(`${MP}/vision_bundle.mjs`);
+      const files = await vision.FilesetResolver.forVisionTasks(`${MP}/wasm`);
+      const make = delegate => vision.HandLandmarker.createFromOptions(files, {
+        baseOptions: { modelAssetPath: MODEL, delegate }, runningMode: 'VIDEO', numHands: 1,
+      });
+      try { tracker = await make('GPU'); } catch { tracker = await make('CPU'); }
+      video.srcObject = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720, facingMode: 'user' }, audio: false });
+      await video.play();
+      $('msg').textContent = '';
+      requestAnimationFrame(loop);
+    }
+    startGame(level, performance.now());
+  } catch (e) { $('msg').textContent = 'เปิดกล้องไม่ได้: ' + (e.message || e); }
+  for (const b of ['easyBtn', 'midBtn', 'hardBtn']) $(b).disabled = false;
+}
+function loop(t) {
+  if (W !== innerWidth || H !== innerHeight) resize();
+  if (video.readyState >= 2 && video.currentTime !== lastVT) {
+    lastVT = video.currentTime;
+    const L = tracker.detectForVideo(video, t).landmarks?.[0];
+    if (L) {
+      const p = toScreen(L[8]); lostAt = 0;
+      smooth = smooth ? { x: smooth.x + (p.x - smooth.x) * 0.5, y: smooth.y + (p.y - smooth.y) * 0.5 } : p;
+    } else if (!lostAt) lostAt = t;
+    if (lostAt && t - lostAt > 250) smooth = null;                  // keep the pointer through a brief dropout
+  }
+  step(smooth, t); draw(t);
+  requestAnimationFrame(loop);
+}
+addEventListener('resize', resize); resize();
+$('easyBtn').onclick = () => start('easy');
+$('midBtn').onclick = () => start('mid');
+$('hardBtn').onclick = () => start('hard');
+window.__mem = { game, step, startGame, draw, layout, size: () => [W, H] };   // test hooks
+</script>
+</body>
+</html>
